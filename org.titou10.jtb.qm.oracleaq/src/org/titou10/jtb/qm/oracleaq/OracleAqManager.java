@@ -24,7 +24,9 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.SortedMap;
 import java.util.SortedSet;
+import java.util.TreeMap;
 import java.util.TreeSet;
 
 import javax.jms.Connection;
@@ -53,36 +55,46 @@ import oracle.jms.AQjmsFactory;
  *
  */
 public class OracleAqManager extends QManager {
-   private static final Logger                     log               = LoggerFactory.getLogger(OracleAqManager.class);
+   private static final Logger                     log                 = LoggerFactory.getLogger(OracleAqManager.class);
 
    // private static final SimpleDateFormat SDF = new SimpleDateFormat("yyyy-MM-dd-HH:mm:ss:SSS");
-   private static final String                     CR                = "\n";
+   private static final String                     CR                  = "\n";
 
-   private final static String                     P_SID             = "sid";
-   private final static String                     P_DRIVER_TYPE     = "driverType";
+   private final static String                     P_SID               = "sid";
+   private final static String                     P_DRIVER_TYPE       = "driverType";
 
-   private static final String                     URL_OCI           = "jdbc:oracle:%s:@(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=%s)(PORT=%s)(CONNECT_DATA=(SID=%s))))";
-   private static final String                     URL_THIN          = "jdbc:oracle:thin:@%s:%s:%s";
+   private static final String                     URL_OCI             = "jdbc:oracle:%s:@(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=%s)(PORT=%s)(CONNECT_DATA=(SID=%s))))";
+   private static final String                     URL_THIN            = "jdbc:oracle:thin:@%s:%s:%s";
 
-   private static final String                     C_NAME            = "NAME";
-   private static final String                     C_RECIPIENTS      = "RECIPIENTS";
-   private static final String                     C_QUEUE_TYPE      = "QUEUE_TYPE";
-   private static final String                     V_QUEUE_MARKER    = "SINGLE";
-   private static final String                     V_EXCEPTION_QUEUE = "EXCEPTION_QUEUE";
+   private static final String                     C_NAME              = "NAME";
+   private static final String                     C_OWNER             = "OWNER";
+   private static final String                     C_RECIPIENTS        = "RECIPIENTS";
+   private static final String                     C_QUEUE_TYPE        = "QUEUE_TYPE";
+   private static final String                     V_QUEUE_MARKER      = "SINGLE";
+   private static final String                     V_EXCEPTION_QUEUE   = "EXCEPTION_QUEUE";
 
-   private static final String                     QUERY_GET_DEST    = "select qu.name" +
-                                                                       "      ,qu.recipients" +
-                                                                       "      ,qu.queue_type" +
-                                                                       "  from user_queues qu" +
-                                                                       "      ,user_queue_tables qt" +
-                                                                       " where qt.queue_table = qu.queue_table" +
-                                                                       "   and qt.object_type like 'SYS.AQ$_JMS%'";
+   private static final String                     QUERY_GET_DEST      = "select qu.*" +
+                                                                         "      ,qt.*" +
+                                                                         // " ,qu.name" +
+                                                                         // " ,qu.recipients" +
+                                                                         "      ,qu.queue_type" +
+                                                                         "  from all_queues qu" +
+                                                                         "      ,all_queue_tables qt" +
+                                                                         " where qt.queue_table = qu.queue_table" +
+                                                                         "   and qt.object_type like 'SYS.AQ$_JMS%'";
+
+   private static final String                     QUERY_GET_DEST_INFO = QUERY_GET_DEST +
+                                                                         "   and qu.owner = ?" +
+                                                                         "   and qu.name = ?";
 
    private static final String                     HELP_TEXT;
 
-   private List<QManagerProperty>                  parameters        = new ArrayList<>();
+   private List<QManagerProperty>                  parameters          = new ArrayList<>();
 
-   private final Map<Integer, java.sql.Connection> jdbcConnections   = new HashMap<>();
+   private final Map<Integer, java.sql.Connection> jdbcConnections     = new HashMap<>();
+   private final Map<Integer, String>              jdbcURLs            = new HashMap<>();
+   private final Map<Integer, String>              jdbcUserids         = new HashMap<>();
+   private final Map<Integer, String>              jdbcPasswords       = new HashMap<>();
 
    // -----------
    // Constructor
@@ -91,9 +103,8 @@ public class OracleAqManager extends QManager {
    public OracleAqManager() {
       log.debug("Instantiate OracleAQ");
 
-      parameters.add(new QManagerProperty(P_SID, true, JMSPropertyKind.STRING, false, "SID", "ORCLCDB"));
-      parameters
-               .add(new QManagerProperty(P_DRIVER_TYPE, true, JMSPropertyKind.STRING, false, "driver (thin, kprb, oci8 )", "thin"));
+      parameters.add(new QManagerProperty(P_SID, true, JMSPropertyKind.STRING, false, "Oracle SID", "ORCLCDB"));
+      parameters.add(new QManagerProperty(P_DRIVER_TYPE, true, JMSPropertyKind.STRING, false, "driver (thin, oci, oci8 )", "thin"));
    }
 
    // ------------------
@@ -137,10 +148,16 @@ public class OracleAqManager extends QManager {
       log.info("connected to {} - {}", sessionDef.getName(), jmsConnection.getClientID());
 
       // Store per connection related data
-      jdbcConnections.put(jmsConnection.hashCode(),
-                          DriverManager.getConnection(url, sessionDef.getActiveUserid(), sessionDef.getActivePassword()));
+      jdbcConnections.put(jmsConnection.hashCode(), jdbcConnect(url, sessionDef.getActiveUserid(), sessionDef.getActivePassword()));
+      jdbcURLs.put(jmsConnection.hashCode(), url);
+      jdbcUserids.put(jmsConnection.hashCode(), sessionDef.getActiveUserid());
+      jdbcPasswords.put(jmsConnection.hashCode(), sessionDef.getActivePassword());
 
       return jmsConnection;
+   }
+
+   private java.sql.Connection jdbcConnect(String url, String userid, String password) throws SQLException {
+      return DriverManager.getConnection(url, userid, password);
    }
 
    @Override
@@ -153,33 +170,106 @@ public class OracleAqManager extends QManager {
       SortedSet<QueueData> queues = new TreeSet<>();
       SortedSet<TopicData> topics = new TreeSet<>();
       var name = "";
+      var owner = "";
       var recipients = "";
       var queueType = "";
 
+      var destinationName = "";
+
       // Read database to get Destinations
-      PreparedStatement preparedStatement = jdbcConnection.prepareStatement(QUERY_GET_DEST);
-      ResultSet resultSet = preparedStatement.executeQuery();
-      while (resultSet.next()) {
-         name = resultSet.getString(C_NAME);
-         recipients = resultSet.getString(C_RECIPIENTS);
-         queueType = resultSet.getString(C_QUEUE_TYPE);
+      try (PreparedStatement preparedStatement = jdbcConnection.prepareStatement(QUERY_GET_DEST)) {
+         ResultSet resultSet = preparedStatement.executeQuery();
+         while (resultSet.next()) {
+            name = resultSet.getString(C_NAME);
+            owner = resultSet.getString(C_OWNER);
+            recipients = resultSet.getString(C_RECIPIENTS);
+            queueType = resultSet.getString(C_QUEUE_TYPE);
 
-         if (!showSystemObjects && queueType.equals(V_EXCEPTION_QUEUE)) {
-            continue;
+            destinationName = owner + "." + name;
+
+            if (!showSystemObjects && queueType.equals(V_EXCEPTION_QUEUE)) {
+               continue;
+            }
+
+            if (V_QUEUE_MARKER.equals(recipients)) {
+               log.debug("Found Queue '{}'.", destinationName);
+               queues.add(new QueueData(destinationName));
+            } else {
+               log.debug("Found Topic '{}'.", destinationName);
+               topics.add(new TopicData(destinationName));
+            }
+
          }
-
-         if (V_QUEUE_MARKER.equals(recipients)) {
-            log.debug("Found Queue '{}'.", name);
-            queues.add(new QueueData(name));
-         } else {
-            log.debug("Found Topic '{}'.", name);
-            topics.add(new TopicData(name));
-         }
-
       }
-      preparedStatement.close();
 
       return new DestinationData(queues, topics);
+   }
+
+   @Override
+   public Map<String, Object> getQueueInformation(Connection jmsConnection, String queueName) {
+      log.debug("Get Destination Information for '{}'", queueName);
+
+      SortedMap<String, Object> properties = new TreeMap<>();
+
+      Integer hash = jmsConnection.hashCode();
+      var jdbcConnection = jdbcConnections.get(hash);
+
+      // Reconnect if connection closed
+      try {
+         if (!jdbcConnection.isValid(0)) {
+            jdbcConnection = jdbcConnect(jdbcURLs.get(hash), jdbcUserids.get(hash), jdbcPasswords.get(hash));
+            jdbcConnections.put(hash, jdbcConnection);
+         }
+      } catch (SQLException e1) {
+         log.error("JDBC connection is closed, or cannot be tested!");
+         return properties;
+      }
+
+      String[] q = queueName.split("[.]");
+      var owner = q[0];
+      var name = q[1];
+
+      // Read database to get Destinations
+      try (PreparedStatement preparedStatement = jdbcConnection.prepareStatement(QUERY_GET_DEST_INFO)) {
+         preparedStatement.setString(1, owner);
+         preparedStatement.setString(2, name);
+         ResultSet resultSet = preparedStatement.executeQuery();
+         resultSet.next();
+
+         // ALL_QUEUE
+         properties.put("QUEUE_TABLE", resultSet.getString("QUEUE_TABLE"));
+         properties.put("QID", resultSet.getString("QID"));
+         properties.put("QUEUE_TYPE", resultSet.getString("QUEUE_TYPE"));
+         properties.put("MAX_RETRIES", resultSet.getString("MAX_RETRIES"));
+         properties.put("RETRY_DELAY", resultSet.getString("RETRY_DELAY"));
+         properties.put("ENQUEUE_ENABLED", resultSet.getString("ENQUEUE_ENABLED").trim());
+         properties.put("DEQUEUE_ENABLED", resultSet.getString("DEQUEUE_ENABLED").trim());
+         properties.put("RETENTION", resultSet.getString("RETENTION"));
+         properties.put("USER_COMMENT", resultSet.getString("USER_COMMENT"));
+         properties.put("SHARDED", resultSet.getString("SHARDED"));
+
+         // ALL_QUEUE_TABLES
+         properties.put("TYPE", resultSet.getString("TYPE"));
+         properties.put("OBJECT_TYPE", resultSet.getString("OBJECT_TYPE"));
+         properties.put("SORT_ORDER", resultSet.getString("SORT_ORDER"));
+         properties.put("MESSAGE_GROUPING", resultSet.getString("MESSAGE_GROUPING"));
+         properties.put("REPLICATION_MODE", resultSet.getString("REPLICATION_MODE"));
+         properties.put("COMPATIBLE", resultSet.getString("COMPATIBLE"));
+         properties.put("PRIMARY_INSTANCE", resultSet.getString("PRIMARY_INSTANCE"));
+         properties.put("SECONDARY_INSTANCE", resultSet.getString("SECONDARY_INSTANCE"));
+         properties.put("SECURE", resultSet.getString("SECURE"));
+
+      } catch (SQLException e) {
+         log.error("Exception when reading Queue Information. Ignoring", e);
+      }
+
+      log.debug("Queue Information : {}", properties);
+      return properties;
+   }
+
+   @Override
+   public Map<String, Object> getTopicInformation(Connection jmsConnection, String topicName) {
+      return getQueueInformation(jmsConnection, topicName);
    }
 
    @Override
@@ -227,7 +317,7 @@ public class OracleAqManager extends QManager {
       sb.append("Properties values:").append(CR);
       sb.append("------------------").append(CR);
       sb.append("sid                : sid.").append(CR);
-      sb.append("driverType         : 'thin', 'oci' , 'oci8'").append(CR);
+      sb.append("driverType         : 'thin', 'oci', 'oci8'").append(CR);
 
       HELP_TEXT = sb.toString();
    }
