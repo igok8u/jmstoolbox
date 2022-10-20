@@ -1,7 +1,7 @@
 2022-??-?? v5.16.0
 ------------------
 - New feature:
-    - 
+    - Initial implementation of Oracle AQ Queue Manager
 - Improvements:
     -  
 - Bugs fixed:

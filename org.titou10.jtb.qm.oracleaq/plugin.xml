@@ -6,7 +6,7 @@
       <qManager
             class="org.titou10.jtb.qm.oracleaq.OracleAqManager"
             displayName="Oracle AQ"
-            id="org.titou10.jtb.qm.oracleaq.ORACLEAQ">
+            id="org.titou10.jtb.qm.oracleaq.OracleAqManager">
       </qManager>
    </extension>
 

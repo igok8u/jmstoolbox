@@ -1,3 +1,19 @@
+/*
+ * Copyright (C) 2015 Denis Forveille titou10.titou10@gmail.com
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 package org.titou10.jtb.qm.oracleaq;
 
 import java.sql.DriverManager;
@@ -5,11 +21,11 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.SortedSet;
 import java.util.TreeSet;
-import java.util.stream.Collectors;
 
 import javax.jms.Connection;
 import javax.jms.ConnectionFactory;
@@ -25,109 +41,165 @@ import org.titou10.jtb.jms.qm.QManagerProperty;
 import org.titou10.jtb.jms.qm.QueueData;
 import org.titou10.jtb.jms.qm.TopicData;
 
+import oracle.jdbc.driver.OracleDriver;
 import oracle.jms.AQjmsFactory;
 
+/**
+ * 
+ * Implements Oracle Advanced Queuing (AQ) Q Provider
+ * 
+ * @author Denis Forveille
+ * @author Ihar Kuzniatsou
+ *
+ */
 public class OracleAqManager extends QManager {
-   private static final Logger    log                      = LoggerFactory.getLogger(OracleAqManager.class);
+   private static final Logger                     log               = LoggerFactory.getLogger(OracleAqManager.class);
 
-   private List<QManagerProperty> parameters               = new ArrayList<QManagerProperty>();
+   // private static final SimpleDateFormat SDF = new SimpleDateFormat("yyyy-MM-dd-HH:mm:ss:SSS");
+   private static final String                     CR                = "\n";
 
-   private final static String    ORACLE_SID_PROPERTY_NAME = "ORACLE_SID";
-   private final static String    DRIVER_PROPERTY_NAME     = "DRIVER";
+   private final static String                     P_SID             = "sid";
+   private final static String                     P_DRIVER_TYPE     = "driverType";
 
-   private String                 url                      = "";
+   private static final String                     URL_OCI           = "jdbc:oracle:%s:@(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=%s)(PORT=%s)(CONNECT_DATA=(SID=%s))))";
+   private static final String                     URL_THIN          = "jdbc:oracle:thin:@%s:%s:%s";
 
-   private String                 host_property_value      = "";
-   private String                 sid_property_value       = "";
-   private Integer                port_property_value      = null;
-   private String                 driver_property_value    = "";
+   private static final String                     C_NAME            = "NAME";
+   private static final String                     C_RECIPIENTS      = "RECIPIENTS";
+   private static final String                     C_QUEUE_TYPE      = "QUEUE_TYPE";
+   private static final String                     V_QUEUE_MARKER    = "SINGLE";
+   private static final String                     V_EXCEPTION_QUEUE = "EXCEPTION_QUEUE";
 
-   private String                 user_property_value      = "";
-   private String                 password_property_value  = "";
+   private static final String                     QUERY_GET_DEST    = "select qu.name" +
+                                                                       "      ,qu.recipients" +
+                                                                       "      ,qu.queue_type" +
+                                                                       "  from user_queues qu" +
+                                                                       "      ,user_queue_tables qt" +
+                                                                       " where qt.queue_table = qu.queue_table" +
+                                                                       "   and qt.object_type like 'SYS.AQ$_JMS%'";
+
+   private static final String                     HELP_TEXT;
+
+   private List<QManagerProperty>                  parameters        = new ArrayList<>();
+
+   private final Map<Integer, java.sql.Connection> jdbcConnections   = new HashMap<>();
+
+   // -----------
+   // Constructor
+   // -----------
 
    public OracleAqManager() {
       log.debug("Instantiate OracleAQ");
-      parameters.add(new QManagerProperty(ORACLE_SID_PROPERTY_NAME, true, JMSPropertyKind.STRING, false, "SID", "xe"));
-      parameters.add(new QManagerProperty(DRIVER_PROPERTY_NAME,
-                                          true,
-                                          JMSPropertyKind.STRING,
-                                          false,
-                                          "driver (thin, kprb, oci8 )",
-                                          "thin"));
+
+      parameters.add(new QManagerProperty(P_SID, true, JMSPropertyKind.STRING, false, "SID", "ORCLCDB"));
+      parameters
+               .add(new QManagerProperty(P_DRIVER_TYPE, true, JMSPropertyKind.STRING, false, "driver (thin, kprb, oci8 )", "thin"));
    }
+
+   // ------------------
+   // Business Interface
+   // ------------------
 
    @Override
    public Connection connect(SessionDef sessionDef, boolean showSystemObjects, String clientID) throws Exception {
       log.info("connecting to {} - {}", sessionDef.getName(), clientID);
-      establish_properties(sessionDef);
+
+      var mapProperties = extractProperties(sessionDef);
+
+      var sid = mapProperties.get(P_SID);
+      var driverType = mapProperties.get(P_DRIVER_TYPE);
+
+      var url = "";
+      switch (driverType) {
+         case "oci":
+         case "oci8":
+            url = String.format(URL_OCI, driverType, sessionDef.getHost(), sessionDef.getPort(), sid);
+            break;
+         case "thin":
+            url = String.format(URL_THIN, sessionDef.getHost(), sessionDef.getPort(), sid);
+            break;
+         default:
+            throw new Exception("Unsupported driver type: " + driverType);
+      }
+
+      log.debug("url: {}", url);
+
+      // Load DB Driver
+      DriverManager.registerDriver(new OracleDriver());
+
+      // ------------------
+      // Get JMS Connection
+      // ------------------
       final ConnectionFactory connectionFactory = AQjmsFactory.getConnectionFactory(url, null);
-      Connection connection = connectionFactory.createConnection(user_property_value, password_property_value);
-      connection.start();
-      return connection;
-   }
+      Connection jmsConnection = connectionFactory.createConnection(sessionDef.getActiveUserid(), sessionDef.getActivePassword());
+      jmsConnection.start();
 
-   private void establish_properties(SessionDef sessionDef) throws JMSException {
-      Map<String, String> mapProperties = extractProperties(sessionDef);
+      log.info("connected to {} - {}", sessionDef.getName(), jmsConnection.getClientID());
 
-      sid_property_value = mapProperties.get(ORACLE_SID_PROPERTY_NAME);
-      driver_property_value = mapProperties.get(DRIVER_PROPERTY_NAME);
+      // Store per connection related data
+      jdbcConnections.put(jmsConnection.hashCode(),
+                          DriverManager.getConnection(url, sessionDef.getActiveUserid(), sessionDef.getActivePassword()));
 
-      host_property_value = sessionDef.getHost();
-      port_property_value = sessionDef.getPort();
-      user_property_value = sessionDef.getActiveUserid();
-      password_property_value = sessionDef.getActivePassword();
-
-      url = createUrl(host_property_value, sid_property_value, port_property_value, driver_property_value);
+      return jmsConnection;
    }
 
    @Override
-   public DestinationData discoverDestinations(Connection jmsConnection, boolean showSystemObjects) throws Exception {
+   public DestinationData discoverDestinations(Connection jmsConnection, boolean showSystemObjects) throws SQLException {
       log.debug("discoverDestinations : {} - {}", jmsConnection, showSystemObjects);
 
-      List<OracleAqDestination> listOfOracleAqDestinations = findOracleAqDestinations(url,
-                                                                                      user_property_value,
-                                                                                      password_property_value);
+      var hash = jmsConnection.hashCode();
+      var jdbcConnection = jdbcConnections.get(hash);
 
-      SortedSet<QueueData> listQueueData = listOfOracleAqDestinations.stream().filter(OracleAqDestination::isQueue)
-               .map(destination -> new QueueData(destination.getName())).collect(Collectors.toCollection(() -> new TreeSet<>()));
+      SortedSet<QueueData> queues = new TreeSet<>();
+      SortedSet<TopicData> topics = new TreeSet<>();
+      var name = "";
+      var recipients = "";
+      var queueType = "";
 
-      SortedSet<TopicData> listTopicData = listOfOracleAqDestinations.stream().filter(OracleAqDestination::isTopic)
-               .map(destination -> new TopicData(destination.getName())).collect(Collectors.toCollection(() -> new TreeSet<>()));
+      // Read database to get Destinations
+      PreparedStatement preparedStatement = jdbcConnection.prepareStatement(QUERY_GET_DEST);
+      ResultSet resultSet = preparedStatement.executeQuery();
+      while (resultSet.next()) {
+         name = resultSet.getString(C_NAME);
+         recipients = resultSet.getString(C_RECIPIENTS);
+         queueType = resultSet.getString(C_QUEUE_TYPE);
 
-      return new DestinationData(listQueueData, listTopicData);
-   }
-
-   private List<OracleAqDestination> findOracleAqDestinations(String jdbcUrl,
-                                                              String jdbcUser,
-                                                              String jdbcPassword) throws SQLException {
-      List<OracleAqDestination> listOfDestinations = new ArrayList<>();
-
-      DriverManager.registerDriver(new oracle.jdbc.OracleDriver());
-
-      try (java.sql.Connection jdbcConnection = DriverManager.getConnection(jdbcUrl, jdbcUser, jdbcPassword)) {
-         String schema = user_property_value.toUpperCase();
-
-         String query = "select NAME,RECIPIENTS from dba_queues qu "
-                        + " left join dba_queue_tables qt on qt.queue_table=qu.queue_table "
-                        + " where qu.queue_type=? and qu.owner =? ";
-
-         PreparedStatement preparedStatement = jdbcConnection.prepareStatement(query);
-         preparedStatement.setString(1, "NORMAL_QUEUE");
-         preparedStatement.setString(2, schema);
-         ResultSet resultSet = preparedStatement.executeQuery();
-
-         while (resultSet.next()) {
-            listOfDestinations.add(new OracleAqDestination(resultSet.getString("NAME"), resultSet.getString("RECIPIENTS")));
+         if (!showSystemObjects && queueType.equals(V_EXCEPTION_QUEUE)) {
+            continue;
          }
-      }
 
-      return listOfDestinations;
+         if (V_QUEUE_MARKER.equals(recipients)) {
+            log.debug("Found Queue '{}'.", name);
+            queues.add(new QueueData(name));
+         } else {
+            log.debug("Found Topic '{}'.", name);
+            topics.add(new TopicData(name));
+         }
+
+      }
+      preparedStatement.close();
+
+      return new DestinationData(queues, topics);
    }
 
    @Override
    public void close(Connection jmsConnection) throws JMSException {
-      jmsConnection.close();
+      Integer hash = jmsConnection.hashCode();
+      var jdbcConnection = jdbcConnections.get(hash);
 
+      try {
+         jmsConnection.close();
+      } catch (JMSException e) {
+         log.warn("Exception occured while closing JMS connection. Ignore it. Msg={}", e.getMessage());
+      }
+
+      try {
+         jdbcConnection.close();
+      } catch (SQLException e) {
+         log.warn("Exception occured while closing JDBC connection. Ignore it. Msg={}", e.getMessage());
+      }
+
+      jdbcConnections.remove(hash);
    }
 
    @Override
@@ -135,53 +207,28 @@ public class OracleAqManager extends QManager {
       return parameters;
    }
 
-   private static String createUrl(String host, String sid, int port, String driver) throws JMSException {
-      String url;
-      if (!"oci8".equals(driver) && !"oci".equals(driver)) {
-         if (!"thin".equals(driver)) {
-            throw new JMSException("unsupported driver");
-         }
-         url = "jdbc:oracle:thin:@" + host + ":" + port + ":" + sid;
-      } else {
-         url = "jdbc:oracle:oci8:@(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(PORT=" + port + ")(HOST=" + host + "))(CONNECT_DATA=(SID="
-               + sid + ")))";
-      }
-      return url;
+   @Override
+   public String getHelpText() {
+      return HELP_TEXT;
    }
 
-   private class OracleAqDestination {
+   static {
+      var sb = new StringBuilder(2048);
+      sb.append("Extra JARS :").append(CR);
+      sb.append("------------").append(CR);
+      sb.append("No extra jar is needed as JMSToolBox is bundled with the latest Apache ActiveMQ jars").append(CR);
+      sb.append(CR);
+      sb.append("Connection:").append(CR);
+      sb.append("-----------").append(CR);
+      sb.append("Host          : Oracle AQ server host name").append(CR);
+      sb.append("Port          : Oracle AQ server port (ie 1521)").append(CR);
+      sb.append("User/Password : User allowed to connect to Oracle AQ").append(CR);
+      sb.append(CR);
+      sb.append("Properties values:").append(CR);
+      sb.append("------------------").append(CR);
+      sb.append("sid                : sid.").append(CR);
+      sb.append("driverType         : 'thin', 'oci' , 'oci8'").append(CR);
 
-      private String name;
-      private String recipients;
-
-      public OracleAqDestination(String name, String recipients) {
-         this.name = name;
-         this.recipients = recipients;
-      }
-
-      public String getName() {
-         return name;
-      }
-
-      public void setName(String name) {
-         this.name = name;
-      }
-
-      public String getRecipients() {
-         return recipients;
-      }
-
-      public void setRecipients(String recipients) {
-         this.recipients = recipients;
-      }
-
-      public boolean isQueue() {
-         return "SINGLE".equals(recipients);
-      }
-
-      public boolean isTopic() {
-         return "MULTIPLE".equals(recipients);
-      }
-
+      HELP_TEXT = sb.toString();
    }
 }
