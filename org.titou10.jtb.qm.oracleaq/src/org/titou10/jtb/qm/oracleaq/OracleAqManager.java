@@ -55,46 +55,41 @@ import oracle.jms.AQjmsFactory;
  *
  */
 public class OracleAqManager extends QManager {
-   private static final Logger                     log                 = LoggerFactory.getLogger(OracleAqManager.class);
+   private static final Logger          log                 = LoggerFactory.getLogger(OracleAqManager.class);
 
    // private static final SimpleDateFormat SDF = new SimpleDateFormat("yyyy-MM-dd-HH:mm:ss:SSS");
-   private static final String                     CR                  = "\n";
+   private static final String          CR                  = "\n";
 
-   private final static String                     P_SID               = "sid";
-   private final static String                     P_DRIVER_TYPE       = "driverType";
+   private final static String          P_SID               = "sid";
+   private final static String          P_DRIVER_TYPE       = "driverType";
 
-   private static final String                     URL_OCI             = "jdbc:oracle:%s:@(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=%s)(PORT=%s)(CONNECT_DATA=(SID=%s))))";
-   private static final String                     URL_THIN            = "jdbc:oracle:thin:@%s:%s:%s";
+   private static final String          URL_OCI             = "jdbc:oracle:%s:@(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=%s)(PORT=%s)(CONNECT_DATA=(SID=%s))))";
+   private static final String          URL_THIN            = "jdbc:oracle:thin:@%s:%s:%s";
 
-   private static final String                     C_NAME              = "NAME";
-   private static final String                     C_OWNER             = "OWNER";
-   private static final String                     C_RECIPIENTS        = "RECIPIENTS";
-   private static final String                     C_QUEUE_TYPE        = "QUEUE_TYPE";
-   private static final String                     V_QUEUE_MARKER      = "SINGLE";
-   private static final String                     V_EXCEPTION_QUEUE   = "EXCEPTION_QUEUE";
+   private static final String          C_NAME              = "NAME";
+   private static final String          C_OWNER             = "OWNER";
+   private static final String          C_RECIPIENTS        = "RECIPIENTS";
+   private static final String          C_QUEUE_TYPE        = "QUEUE_TYPE";
+   private static final String          V_QUEUE_MARKER      = "SINGLE";
+   private static final String          V_EXCEPTION_QUEUE   = "EXCEPTION_QUEUE";
 
-   private static final String                     QUERY_GET_DEST      = "select qu.*" +
-                                                                         "      ,qt.*" +
-                                                                         // " ,qu.name" +
-                                                                         // " ,qu.recipients" +
-                                                                         "      ,qu.queue_type" +
-                                                                         "  from all_queues qu" +
-                                                                         "      ,all_queue_tables qt" +
-                                                                         " where qt.queue_table = qu.queue_table" +
-                                                                         "   and qt.object_type like 'SYS.AQ$_JMS%'";
+   private static final String          QUERY_GET_DEST      = "select qu.*" +
+                                                              "      ,qt.*" +
+                                                              // " ,qu.name" +
+                                                              // " ,qu.recipients" +
+                                                              "      ,qu.queue_type" +
+                                                              "  from all_queues qu" +
+                                                              "      ,all_queue_tables qt" +
+                                                              " where qt.queue_table = qu.queue_table" +
+                                                              "   and qt.object_type like 'SYS.AQ$_JMS%'";
 
-   private static final String                     QUERY_GET_DEST_INFO = QUERY_GET_DEST +
-                                                                         "   and qu.owner = ?" +
-                                                                         "   and qu.name = ?";
+   private static final String          QUERY_GET_DEST_INFO = QUERY_GET_DEST + "   and qu.owner = ?" + "   and qu.name = ?";
 
-   private static final String                     HELP_TEXT;
+   private static final String          HELP_TEXT;
 
-   private List<QManagerProperty>                  parameters          = new ArrayList<>();
+   private List<QManagerProperty>       parameters          = new ArrayList<>();
 
-   private final Map<Integer, java.sql.Connection> jdbcConnections     = new HashMap<>();
-   private final Map<Integer, String>              jdbcURLs            = new HashMap<>();
-   private final Map<Integer, String>              jdbcUserids         = new HashMap<>();
-   private final Map<Integer, String>              jdbcPasswords       = new HashMap<>();
+   private final Map<Integer, JDBCData> jdbcDatas           = new HashMap<>();
 
    // -----------
    // Constructor
@@ -148,16 +143,13 @@ public class OracleAqManager extends QManager {
       log.info("connected to {} - {}", sessionDef.getName(), jmsConnection.getClientID());
 
       // Store per connection related data
-      jdbcConnections.put(jmsConnection.hashCode(), jdbcConnect(url, sessionDef.getActiveUserid(), sessionDef.getActivePassword()));
-      jdbcURLs.put(jmsConnection.hashCode(), url);
-      jdbcUserids.put(jmsConnection.hashCode(), sessionDef.getActiveUserid());
-      jdbcPasswords.put(jmsConnection.hashCode(), sessionDef.getActivePassword());
+      jdbcDatas.put(jmsConnection.hashCode(),
+                    new JDBCData(jdbcConnect(url, sessionDef.getActiveUserid(), sessionDef.getActivePassword()),
+                                 url,
+                                 sessionDef.getActiveUserid(),
+                                 sessionDef.getActivePassword()));
 
       return jmsConnection;
-   }
-
-   private java.sql.Connection jdbcConnect(String url, String userid, String password) throws SQLException {
-      return DriverManager.getConnection(url, userid, password);
    }
 
    @Override
@@ -165,7 +157,7 @@ public class OracleAqManager extends QManager {
       log.debug("discoverDestinations : {} - {}", jmsConnection, showSystemObjects);
 
       var hash = jmsConnection.hashCode();
-      var jdbcConnection = jdbcConnections.get(hash);
+      var jdbcData = jdbcDatas.get(hash);
 
       SortedSet<QueueData> queues = new TreeSet<>();
       SortedSet<TopicData> topics = new TreeSet<>();
@@ -177,7 +169,7 @@ public class OracleAqManager extends QManager {
       var destinationName = "";
 
       // Read database to get Destinations
-      try (PreparedStatement preparedStatement = jdbcConnection.prepareStatement(QUERY_GET_DEST)) {
+      try (PreparedStatement preparedStatement = jdbcData.jdbcConnection.prepareStatement(QUERY_GET_DEST)) {
          ResultSet resultSet = preparedStatement.executeQuery();
          while (resultSet.next()) {
             name = resultSet.getString(C_NAME);
@@ -212,13 +204,12 @@ public class OracleAqManager extends QManager {
       SortedMap<String, Object> properties = new TreeMap<>();
 
       Integer hash = jmsConnection.hashCode();
-      var jdbcConnection = jdbcConnections.get(hash);
+      var jdbcData = jdbcDatas.get(hash);
 
       // Reconnect if connection closed
       try {
-         if (!jdbcConnection.isValid(0)) {
-            jdbcConnection = jdbcConnect(jdbcURLs.get(hash), jdbcUserids.get(hash), jdbcPasswords.get(hash));
-            jdbcConnections.put(hash, jdbcConnection);
+         if (!jdbcData.jdbcConnection.isValid(0)) {
+            jdbcData.jdbcConnection = jdbcConnect(jdbcData.jdbcURL, jdbcData.jdbcUserid, jdbcData.jdbcPassword);
          }
       } catch (SQLException e1) {
          log.error("JDBC connection is closed, or cannot be tested!");
@@ -230,7 +221,7 @@ public class OracleAqManager extends QManager {
       var name = q[1];
 
       // Read database to get Destinations
-      try (PreparedStatement preparedStatement = jdbcConnection.prepareStatement(QUERY_GET_DEST_INFO)) {
+      try (PreparedStatement preparedStatement = jdbcData.jdbcConnection.prepareStatement(QUERY_GET_DEST_INFO)) {
          preparedStatement.setString(1, owner);
          preparedStatement.setString(2, name);
          ResultSet resultSet = preparedStatement.executeQuery();
@@ -275,7 +266,7 @@ public class OracleAqManager extends QManager {
    @Override
    public void close(Connection jmsConnection) throws JMSException {
       Integer hash = jmsConnection.hashCode();
-      var jdbcConnection = jdbcConnections.get(hash);
+      var jdbcData = jdbcDatas.get(hash);
 
       try {
          jmsConnection.close();
@@ -284,12 +275,12 @@ public class OracleAqManager extends QManager {
       }
 
       try {
-         jdbcConnection.close();
+         jdbcData.jdbcConnection.close();
       } catch (SQLException e) {
          log.warn("Exception occured while closing JDBC connection. Ignore it. Msg={}", e.getMessage());
       }
 
-      jdbcConnections.remove(hash);
+      jdbcDatas.remove(hash);
    }
 
    @Override
@@ -320,5 +311,24 @@ public class OracleAqManager extends QManager {
       sb.append("driverType         : 'thin', 'oci', 'oci8'").append(CR);
 
       HELP_TEXT = sb.toString();
+   }
+
+   // JDBC Helpers
+   private java.sql.Connection jdbcConnect(String url, String userid, String password) throws SQLException {
+      return DriverManager.getConnection(url, userid, password);
+   }
+
+   private final class JDBCData {
+      public java.sql.Connection jdbcConnection;
+      public final String        jdbcURL;
+      public final String        jdbcUserid;
+      public final String        jdbcPassword;
+
+      public JDBCData(java.sql.Connection jdbcConnection, String jdbcURL, String jdbcUserid, String jdbcPassword) {
+         this.jdbcConnection = jdbcConnection;
+         this.jdbcURL = jdbcURL;
+         this.jdbcUserid = jdbcUserid;
+         this.jdbcPassword = jdbcPassword;
+      }
    }
 }
