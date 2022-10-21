@@ -212,7 +212,7 @@ public class OracleAqManager extends QManager {
             jdbcData.jdbcConnection = jdbcConnect(jdbcData.jdbcURL, jdbcData.jdbcUserid, jdbcData.jdbcPassword);
          }
       } catch (SQLException e1) {
-         log.error("JDBC connection is closed, or cannot be tested!");
+         log.error("JDBC connection is closed, and test/reconnect failed!");
          return properties;
       }
 
