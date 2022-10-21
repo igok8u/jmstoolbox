@@ -43,7 +43,7 @@ public class AboutDialog extends Dialog {
    private static final String CONTRIBUTORS_2  = "Yannick Beaudoin, Ralf Lehmann";
    private static final String CONTRIBUTORS_3  = "Raymond Meester (SonicMQ plugin), Monica Zhang (Solace plugin)";
    private static final String CONTRIBUTORS_4  = "Anqi Yan (Azure Service Bus plugin)";
-   private static final String CONTRIBUTORS_5  = "Ihar Kuziatsou (Oracle AQ plugin)";
+   private static final String CONTRIBUTORS_5  = "Ihar Kuzniatsou (Oracle AQ plugin)";
    private static final String VERSION_1       = "v%s (%s)";
    private static final String VERSION_2       = "%s-%s-%s %s:%s";
    private static final String EMAIL           = "titou10.titou10@gmail.com";
